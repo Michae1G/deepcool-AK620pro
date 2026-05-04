@@ -45,6 +45,7 @@ dependencies = [
  "cpu-monitor",
  "hidapi",
  "libloading",
+ "winapi",
 ]
 
 [[package]]

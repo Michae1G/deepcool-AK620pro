@@ -4,9 +4,14 @@
 
 use crate::monitor::{cpu::Cpu, gpu::Gpu};
 use super::{device_error, Mode};
-use cpu_monitor::CpuInstant;
 use hidapi::HidApi;
 use std::{thread::sleep, time::Duration};
+
+// Platform-specific CpuInstant type
+#[cfg(target_os = "linux")]
+use cpu_monitor::CpuInstant;
+#[cfg(target_os = "windows")]
+type CpuInstant = ();
 
 /// Helper module for the LP Series.
 mod dot_matrix {

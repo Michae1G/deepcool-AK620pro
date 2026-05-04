@@ -9,6 +9,10 @@ hidapi = "2.6.5"
 cpu-monitor = "0.1.1"
 colored = "3.1.1"
 
+# Windows specific dependencies
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winbase", "winnt", "processthreadsapi", "sysinfoapi", "pdh", "winreg", "winerror", "errhandlingapi", "minwindef", "fileapi", "handleapi"] }
+
 [profile.release]
 opt-level = 3
 lto = true
