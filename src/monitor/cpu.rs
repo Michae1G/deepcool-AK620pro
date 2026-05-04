@@ -185,9 +185,13 @@ static LAST_KERNEL: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "windows")]
 static LAST_USER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "windows")]
-static CACHED_TEMP: AtomicU8 = AtomicU8::new(0);
+static CACHED_CPU_TEMP: AtomicU8 = AtomicU8::new(0);
 #[cfg(target_os = "windows")]
-static CACHED_POWER: AtomicU16 = AtomicU16::new(0);
+static CACHED_CPU_POWER: AtomicU16 = AtomicU16::new(0);
+#[cfg(target_os = "windows")]
+static CACHED_GPU_TEMP: AtomicU8 = AtomicU8::new(0);
+#[cfg(target_os = "windows")]
+static CACHED_GPU_POWER: AtomicU16 = AtomicU16::new(0);
 #[cfg(target_os = "windows")]
 static LHM_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -250,8 +254,20 @@ impl Cpu {
             }
         };
 
-        // Start Python process
-        let result = Command::new("python")
+        // Start Python process - use full path to avoid Windows Store stub
+        let python_path = std::path::PathBuf::from(
+            std::env::var("LOCALAPPDATA")
+                .unwrap_or_else(|_| "C:\\Users\\84765\\AppData\\Local".to_string())
+        ).join("Programs\\Python\\Python312\\python.exe");
+
+        let python_exe = if python_path.exists() {
+            python_path
+        } else {
+            // Fallback to system python
+            std::path::PathBuf::from("python")
+        };
+
+        let result = Command::new(&python_exe)
             .arg(&script_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -283,9 +299,19 @@ impl Cpu {
                                         match reader.read_line(&mut data_line) {
                                             Ok(0) => break, // EOF
                                             Ok(_) => {
-                                                if let Some((temp, power)) = Self::parse_lhm_line(&data_line) {
-                                                    CACHED_TEMP.store(temp, Ordering::SeqCst);
-                                                    CACHED_POWER.store(power, Ordering::SeqCst);
+                                                if let Some((cpu_temp, cpu_power, gpu_temp, gpu_power)) = Self::parse_lhm_line(&data_line) {
+                                                    if cpu_temp > 0 {
+                                                        CACHED_CPU_TEMP.store(cpu_temp, Ordering::SeqCst);
+                                                    }
+                                                    if cpu_power > 0 {
+                                                        CACHED_CPU_POWER.store(cpu_power, Ordering::SeqCst);
+                                                    }
+                                                    if gpu_temp > 0 {
+                                                        CACHED_GPU_TEMP.store(gpu_temp, Ordering::SeqCst);
+                                                    }
+                                                    if gpu_power > 0 {
+                                                        CACHED_GPU_POWER.store(gpu_power, Ordering::SeqCst);
+                                                    }
                                                 }
                                             }
                                             Err(_) => break,
@@ -317,31 +343,50 @@ impl Cpu {
         }
     }
 
-    /// Parse LHM output line: "TEMP:xx.x|POWER:xx.x"
-    fn parse_lhm_line(line: &str) -> Option<(u8, u16)> {
+    /// Parse LHM output line: "CPU_TEMP:xx.x|CPU_POWER:xx.x|GPU_TEMP:xx.x|GPU_POWER:xx.x"
+    fn parse_lhm_line(line: &str) -> Option<(u8, u16, u8, u16)> {
         let line = line.trim();
-        let mut temp: Option<u8> = None;
-        let mut power: Option<u16> = None;
+        let mut cpu_temp: Option<u8> = None;
+        let mut cpu_power: Option<u16> = None;
+        let mut gpu_temp: Option<u8> = None;
+        let mut gpu_power: Option<u16> = None;
 
         for part in line.split('|') {
-            if part.starts_with("TEMP:") {
-                if let Ok(val) = part[5..].parse::<f32>() {
+            if part.starts_with("CPU_TEMP:") {
+                if let Ok(val) = part[9..].parse::<f32>() {
                     if val > 0.0 && val < 150.0 {
-                        temp = Some(val as u8);
+                        cpu_temp = Some(val as u8);
                     }
                 }
-            } else if part.starts_with("POWER:") {
-                if let Ok(val) = part[6..].parse::<f32>() {
+            } else if part.starts_with("CPU_POWER:") {
+                if let Ok(val) = part[10..].parse::<f32>() {
                     if val >= 0.0 && val < 500.0 {
-                        power = Some(val as u16);
+                        cpu_power = Some(val as u16);
+                    }
+                }
+            } else if part.starts_with("GPU_TEMP:") {
+                if let Ok(val) = part[9..].parse::<f32>() {
+                    if val > 0.0 && val < 150.0 {
+                        gpu_temp = Some(val as u8);
+                    }
+                }
+            } else if part.starts_with("GPU_POWER:") {
+                if let Ok(val) = part[10..].parse::<f32>() {
+                    if val >= 0.0 && val < 600.0 {
+                        gpu_power = Some(val as u16);
                     }
                 }
             }
         }
 
-        match (temp, power) {
-            (Some(t), Some(p)) => Some((t, p)),
-            _ => None,
+        // Return parsed values (N/A values will remain None)
+        match (cpu_temp, cpu_power, gpu_temp, gpu_power) {
+            (ct, cp, gt, gp) => Some((
+                ct.unwrap_or(0),
+                cp.unwrap_or(0),
+                gt.unwrap_or(0),
+                gp.unwrap_or(0),
+            )),
         }
     }
 
@@ -362,7 +407,13 @@ impl Cpu {
     /// Get CPU temperature - from LHM or estimated
     pub fn get_temp(&self, fahrenheit: bool) -> u8 {
         let temp = if self.temp_available {
-            CACHED_TEMP.load(Ordering::SeqCst)
+            let cached = CACHED_CPU_TEMP.load(Ordering::SeqCst);
+            if cached > 0 {
+                cached
+            } else {
+                // Fallback to estimate if LHM returns 0 (AMD Ryzen issue)
+                self.estimate_temp()
+            }
         } else {
             self.estimate_temp()
         };
@@ -377,10 +428,31 @@ impl Cpu {
     /// Get CPU power - from LHM or estimated
     pub fn get_power(&self, _initial_energy: u64, _delta_millisec: u64) -> u16 {
         if self.power_available {
-            CACHED_POWER.load(Ordering::SeqCst)
+            let cached = CACHED_CPU_POWER.load(Ordering::SeqCst);
+            if cached > 0 {
+                cached
+            } else {
+                // Fallback to estimate if LHM returns 0
+                self.estimate_power()
+            }
         } else {
             self.estimate_power()
         }
+    }
+
+    /// Get GPU temperature - from LHM
+    pub fn get_gpu_temp(&self, fahrenheit: bool) -> u8 {
+        let temp = CACHED_GPU_TEMP.load(Ordering::SeqCst);
+        if fahrenheit {
+            (temp as f32 * 9.0 / 5.0 + 32.0) as u8
+        } else {
+            temp
+        }
+    }
+
+    /// Get GPU power - from LHM
+    pub fn get_gpu_power(&self) -> u16 {
+        CACHED_GPU_POWER.load(Ordering::SeqCst)
     }
 
     fn estimate_temp(&self) -> u8 {
