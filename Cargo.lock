@@ -38,7 +38,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "deepcool-digital-linux"
+name = "deepcool-monitor"
 version = "0.10.5"
 dependencies = [
  "colored",
