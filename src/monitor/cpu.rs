@@ -188,10 +188,43 @@ pub struct Cpu {
 #[cfg(target_os = "windows")]
 impl Cpu {
     pub fn new() -> Self {
+        // Check if we can get temperature via PowerShell/WMI
+        let temp_available = Self::test_wmi_temp();
+
+        if temp_available {
+            println!("         CPU temperature monitoring via WMI is available.");
+        } else {
+            warning!("CPU temperature monitoring requires running as Administrator");
+            eprintln!("         CPU temperature will be estimated based on usage.");
+        }
+
         Cpu {
-            temp_available: false,
+            temp_available,
             power_available: false,
         }
+    }
+
+    fn test_wmi_temp() -> bool {
+        // Test if WMI temperature query works
+        use std::process::Command;
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command",
+                "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -ErrorAction SilentlyContinue).CurrentTemperature"])
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.trim().is_empty() && output.status.success() {
+                if let Ok(temp) = stdout.trim().parse::<f32>() {
+                    // Valid temperature should be in reasonable range (tenths of Kelvin)
+                    let temp_c = (temp - 2732.0) / 10.0;
+                    if temp_c > 0.0 && temp_c < 150.0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     pub fn warn_temp(&self) {
@@ -208,18 +241,49 @@ impl Cpu {
         }
     }
 
-    /// Get CPU temperature (estimated on Windows)
+    /// Get CPU temperature - try WMI first, fallback to estimation
     pub fn get_temp(&self, fahrenheit: bool) -> u8 {
+        let temp = if self.temp_available {
+            self.get_wmi_temp().unwrap_or_else(|| self.estimate_temp())
+        } else {
+            self.estimate_temp()
+        };
+
+        if fahrenheit {
+            (temp as f32 * 9.0 / 5.0 + 32.0) as u8
+        } else {
+            temp
+        }
+    }
+
+    fn get_wmi_temp(&self) -> Option<u8> {
+        use std::process::Command;
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command",
+                "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -ErrorAction SilentlyContinue).CurrentTemperature"])
+            .output()
+            .ok()?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return None;
+        }
+
+        let temp_k = stdout.trim().parse::<f32>().ok()?;
+        let temp_c = (temp_k - 2732.0) / 10.0;
+
+        if temp_c > 0.0 && temp_c < 150.0 {
+            Some(temp_c as u8)
+        } else {
+            None
+        }
+    }
+
+    fn estimate_temp(&self) -> u8 {
         let usage = self.get_usage_instant();
         let base_temp = 35.0f32;
         let load_temp = usage as f32 * 0.45;
-        let temp = base_temp + load_temp;
-
-        if fahrenheit {
-            (temp * 9.0 / 5.0 + 32.0) as u8
-        } else {
-            temp as u8
-        }
+        (base_temp + load_temp) as u8
     }
 
     /// Not available on Windows
