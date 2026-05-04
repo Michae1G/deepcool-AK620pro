@@ -162,9 +162,13 @@ use std::ffi::OsString;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU16, AtomicU8, AtomicBool, Ordering};
 #[cfg(target_os = "windows")]
-use std::time::Instant;
+use std::process::{Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::io::{BufRead, BufReader};
+#[cfg(target_os = "windows")]
+use std::thread;
 #[cfg(target_os = "windows")]
 use winapi::um::processthreadsapi::GetSystemTimes;
 #[cfg(target_os = "windows")]
@@ -182,80 +186,183 @@ static LAST_KERNEL: AtomicU64 = AtomicU64::new(0);
 static LAST_USER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "windows")]
 static CACHED_TEMP: AtomicU8 = AtomicU8::new(0);
+#[cfg(target_os = "windows")]
+static CACHED_POWER: AtomicU16 = AtomicU16::new(0);
+#[cfg(target_os = "windows")]
+static LHM_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 pub struct Cpu {
     temp_available: bool,
     power_available: bool,
-    temp_last_update: Instant,
 }
 
 #[cfg(target_os = "windows")]
 impl Cpu {
-    // Update temperature every 3 seconds (PowerShell call is slow)
-    const TEMP_UPDATE_INTERVAL_SECS: u64 = 3;
-
     pub fn new() -> Self {
-        // Check if we can get temperature via PowerShell/WMI
-        let temp_available = Self::test_wmi_temp();
+        // Try to start LibreHardwareMonitor provider in background thread
+        let (temp_available, power_available) = Self::start_lhm_thread();
 
-        if temp_available {
-            println!("         CPU temperature monitoring via WMI is available.");
+        if temp_available && power_available {
+            println!("         LibreHardwareMonitor initialized successfully.");
+            println!("         Real CPU temperature and power monitoring enabled.");
         } else {
-            warning!("CPU temperature monitoring requires running as Administrator");
-            eprintln!("         CPU temperature will be estimated based on usage.");
+            warning!("LibreHardwareMonitor not available");
+            eprintln!("         CPU temperature and power will be estimated.");
+            eprintln!("         Ensure lhm_provider.py and LibreHardwareMonitor DLLs are present.");
         }
 
         Cpu {
             temp_available,
-            power_available: false,
-            temp_last_update: Instant::now(),
+            power_available,
         }
     }
 
-    fn test_wmi_temp() -> bool {
-        // Test if WMI temperature query works
-        use std::process::Command;
-        let output = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "try { (Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -ErrorAction Stop).CurrentTemperature } catch { }"])
-            .output();
+    /// Start the LHM provider in a background thread
+    fn start_lhm_thread() -> (bool, bool) {
+        // Get the executable directory to find lhm_provider.py
+        let exe_path = std::env::current_exe().ok();
+        let exe_dir = exe_path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+        
+        // Try to find lhm_provider.py
+        let script_path = if let Some(dir) = &exe_dir {
+            let path = dir.join("lhm_provider.py");
+            if path.exists() {
+                Some(path)
+            } else {
+                // Try current directory
+                let cwd_path = std::path::PathBuf::from("lhm_provider.py");
+                if cwd_path.exists() {
+                    Some(cwd_path)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.trim().is_empty() && output.status.success() {
-                if let Ok(temp) = stdout.trim().parse::<f32>() {
-                    // Valid temperature should be in reasonable range (tenths of Kelvin)
-                    let temp_c = (temp - 2732.0) / 10.0;
-                    if temp_c > 0.0 && temp_c < 150.0 {
-                        // Cache the initial temperature
-                        CACHED_TEMP.store(temp_c as u8, Ordering::SeqCst);
-                        return true;
+        let script_path = match script_path {
+            Some(p) => p,
+            None => {
+                eprintln!("         lhm_provider.py not found");
+                return (false, false);
+            }
+        };
+
+        // Start Python process
+        let result = Command::new("python")
+            .arg(&script_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                // Get stdout reader
+                let stdout = child.stdout.take();
+                if let Some(stdout) = stdout {
+                    let mut reader = BufReader::new(stdout);
+                    
+                    // Wait for READY signal (with timeout)
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(_) => {
+                            let line = line.trim();
+                            if line == "READY" {
+                                // Mark as running
+                                LHM_RUNNING.store(true, Ordering::SeqCst);
+                                
+                                // Spawn background thread to continuously read data
+                                thread::spawn(move || {
+                                    loop {
+                                        if !LHM_RUNNING.load(Ordering::SeqCst) {
+                                            break;
+                                        }
+                                        let mut data_line = String::new();
+                                        match reader.read_line(&mut data_line) {
+                                            Ok(0) => break, // EOF
+                                            Ok(_) => {
+                                                if let Some((temp, power)) = Self::parse_lhm_line(&data_line) {
+                                                    CACHED_TEMP.store(temp, Ordering::SeqCst);
+                                                    CACHED_POWER.store(power, Ordering::SeqCst);
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                });
+                                
+                                return (true, true);
+                            } else if line == "NO_LHM" {
+                                let _ = child.kill();
+                                return (false, false);
+                            }
+                        }
+                        Err(_) => {
+                            let _ = child.kill();
+                            return (false, false);
+                        }
+                    }
+                }
+                let _ = child.kill();
+                (false, false)
+            }
+            Err(e) => {
+                eprintln!("         Failed to start lhm_provider.py: {}", e);
+                (false, false)
+            }
+        }
+    }
+
+    /// Parse LHM output line: "TEMP:xx.x|POWER:xx.x"
+    fn parse_lhm_line(line: &str) -> Option<(u8, u16)> {
+        let line = line.trim();
+        let mut temp: Option<u8> = None;
+        let mut power: Option<u16> = None;
+
+        for part in line.split('|') {
+            if part.starts_with("TEMP:") {
+                if let Ok(val) = part[5..].parse::<f32>() {
+                    if val > 0.0 && val < 150.0 {
+                        temp = Some(val as u8);
+                    }
+                }
+            } else if part.starts_with("POWER:") {
+                if let Ok(val) = part[6..].parse::<f32>() {
+                    if val >= 0.0 && val < 500.0 {
+                        power = Some(val as u16);
                     }
                 }
             }
         }
-        false
+
+        match (temp, power) {
+            (Some(t), Some(p)) => Some((t, p)),
+            _ => None,
+        }
     }
 
     pub fn warn_temp(&self) {
         if !self.temp_available {
-            warning!("CPU temperature monitoring requires running as Administrator");
+            warning!("CPU temperature monitoring requires LibreHardwareMonitor");
             eprintln!("         CPU temperature will be estimated based on usage.");
         }
     }
 
     pub fn warn_rapl(&self) {
         if !self.power_available {
-            warning!("CPU power monitoring is not available on Windows");
+            warning!("CPU power monitoring requires LibreHardwareMonitor");
             eprintln!("         CPU power will be estimated based on usage and TDP.");
         }
     }
 
-    /// Get CPU temperature - try WMI first (cached), fallback to estimation
+    /// Get CPU temperature - from LHM or estimated
     pub fn get_temp(&self, fahrenheit: bool) -> u8 {
         let temp = if self.temp_available {
-            self.get_cached_wmi_temp()
+            CACHED_TEMP.load(Ordering::SeqCst)
         } else {
             self.estimate_temp()
         };
@@ -267,42 +374,12 @@ impl Cpu {
         }
     }
 
-    fn get_cached_wmi_temp(&self) -> u8 {
-        // Check if we need to update the cache
-        let elapsed = self.temp_last_update.elapsed().as_secs();
-
-        if elapsed >= Self::TEMP_UPDATE_INTERVAL_SECS {
-            // Time to update - spawn a background update
-            if let Some(new_temp) = Self::fetch_wmi_temp() {
-                CACHED_TEMP.store(new_temp, Ordering::SeqCst);
-                return new_temp;
-            }
-        }
-
-        // Return cached value
-        CACHED_TEMP.load(Ordering::SeqCst)
-    }
-
-    fn fetch_wmi_temp() -> Option<u8> {
-        use std::process::Command;
-        let output = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command",
-                "try { (Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -ErrorAction Stop).CurrentTemperature } catch { }"])
-            .output()
-            .ok()?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.trim().is_empty() {
-            return None;
-        }
-
-        let temp_k = stdout.trim().parse::<f32>().ok()?;
-        let temp_c = (temp_k - 2732.0) / 10.0;
-
-        if temp_c > 0.0 && temp_c < 150.0 {
-            Some(temp_c as u8)
+    /// Get CPU power - from LHM or estimated
+    pub fn get_power(&self, _initial_energy: u64, _delta_millisec: u64) -> u16 {
+        if self.power_available {
+            CACHED_POWER.load(Ordering::SeqCst)
         } else {
-            None
+            self.estimate_power()
         }
     }
 
@@ -313,18 +390,17 @@ impl Cpu {
         (base_temp + load_temp) as u8
     }
 
-    /// Not available on Windows
-    pub fn read_energy(&self) -> u64 {
-        0
-    }
-
-    /// Get CPU power (estimated on Windows)
-    pub fn get_power(&self, _initial_energy: u64, _delta_millisec: u64) -> u16 {
+    fn estimate_power(&self) -> u16 {
         let usage = self.get_usage_instant();
         let base_power = 10.0f32;
         let max_tdp = 125.0f32;
         let power = base_power + (usage as f32 / 100.0) * (max_tdp - base_power);
         power as u16
+    }
+
+    /// Not available on Windows
+    pub fn read_energy(&self) -> u64 {
+        0
     }
 
     /// Dummy instant for compatibility - returns ()
