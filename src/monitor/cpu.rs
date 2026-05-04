@@ -162,7 +162,9 @@ use std::ffi::OsString;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 #[cfg(target_os = "windows")]
 use winapi::um::processthreadsapi::GetSystemTimes;
 #[cfg(target_os = "windows")]
@@ -178,15 +180,21 @@ static LAST_IDLE: AtomicU64 = AtomicU64::new(0);
 static LAST_KERNEL: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "windows")]
 static LAST_USER: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static CACHED_TEMP: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(target_os = "windows")]
 pub struct Cpu {
     temp_available: bool,
     power_available: bool,
+    temp_last_update: Instant,
 }
 
 #[cfg(target_os = "windows")]
 impl Cpu {
+    // Update temperature every 3 seconds (PowerShell call is slow)
+    const TEMP_UPDATE_INTERVAL_SECS: u64 = 3;
+
     pub fn new() -> Self {
         // Check if we can get temperature via PowerShell/WMI
         let temp_available = Self::test_wmi_temp();
@@ -201,6 +209,7 @@ impl Cpu {
         Cpu {
             temp_available,
             power_available: false,
+            temp_last_update: Instant::now(),
         }
     }
 
@@ -208,8 +217,8 @@ impl Cpu {
         // Test if WMI temperature query works
         use std::process::Command;
         let output = Command::new("powershell")
-            .args(["-NoProfile", "-Command",
-                "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -ErrorAction SilentlyContinue).CurrentTemperature"])
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "try { (Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -ErrorAction Stop).CurrentTemperature } catch { }"])
             .output();
 
         if let Ok(output) = output {
@@ -219,6 +228,8 @@ impl Cpu {
                     // Valid temperature should be in reasonable range (tenths of Kelvin)
                     let temp_c = (temp - 2732.0) / 10.0;
                     if temp_c > 0.0 && temp_c < 150.0 {
+                        // Cache the initial temperature
+                        CACHED_TEMP.store(temp_c as u8, Ordering::SeqCst);
                         return true;
                     }
                 }
@@ -241,10 +252,10 @@ impl Cpu {
         }
     }
 
-    /// Get CPU temperature - try WMI first, fallback to estimation
+    /// Get CPU temperature - try WMI first (cached), fallback to estimation
     pub fn get_temp(&self, fahrenheit: bool) -> u8 {
         let temp = if self.temp_available {
-            self.get_wmi_temp().unwrap_or_else(|| self.estimate_temp())
+            self.get_cached_wmi_temp()
         } else {
             self.estimate_temp()
         };
@@ -256,11 +267,27 @@ impl Cpu {
         }
     }
 
-    fn get_wmi_temp(&self) -> Option<u8> {
+    fn get_cached_wmi_temp(&self) -> u8 {
+        // Check if we need to update the cache
+        let elapsed = self.temp_last_update.elapsed().as_secs();
+
+        if elapsed >= Self::TEMP_UPDATE_INTERVAL_SECS {
+            // Time to update - spawn a background update
+            if let Some(new_temp) = Self::fetch_wmi_temp() {
+                CACHED_TEMP.store(new_temp, Ordering::SeqCst);
+                return new_temp;
+            }
+        }
+
+        // Return cached value
+        CACHED_TEMP.load(Ordering::SeqCst)
+    }
+
+    fn fetch_wmi_temp() -> Option<u8> {
         use std::process::Command;
         let output = Command::new("powershell")
-            .args(["-NoProfile", "-Command",
-                "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -ErrorAction SilentlyContinue).CurrentTemperature"])
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "try { (Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi' -ErrorAction Stop).CurrentTemperature } catch { }"])
             .output()
             .ok()?;
 
